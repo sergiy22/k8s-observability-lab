@@ -1,0 +1,77 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: demo-api
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: demo-api
+spec:
+  groups:
+    - name: demo-api.recording
+      interval: 30s
+      rules:
+        - record: demo_api:http_requests:rate5m
+          expr: sum(rate(http_requests_total{namespace="demo", service="demo-api"}[5m]))
+        - record: demo_api:http_errors:ratio_rate5m
+          expr: |
+            sum(rate(http_requests_total{namespace="demo", service="demo-api", status=~"5.."}[5m]))
+              /
+            sum(rate(http_requests_total{namespace="demo", service="demo-api"}[5m]))
+        - record: demo_api:http_latency_seconds:p95_5m
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (rate(http_request_duration_seconds_bucket{namespace="demo", service="demo-api"}[5m])))
+
+    - name: demo-api.alerts
+      rules:
+        - alert: DemoApiDown
+          expr: |
+            sum(up{namespace="demo", service="demo-api"}) == 0
+              or
+            absent(up{namespace="demo", service="demo-api"})
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: demo-api has no healthy scrape targets
+            description: Prometheus cannot scrape any demo-api pod for 2 minutes.
+            runbook_url: https://github.com/sergiy22/k8s-observability-lab/blob/main/docs/runbooks.md#demoapidown
+
+        - alert: DemoApiHighErrorRate
+          expr: demo_api:http_errors:ratio_rate5m > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: demo-api 5xx ratio above 5%
+            description: 'Error ratio is {{ $value | humanizePercentage }} over the last 5 minutes.'
+            runbook_url: https://github.com/sergiy22/k8s-observability-lab/blob/main/docs/runbooks.md#demoapihigherrorrate
+
+        - alert: DemoApiHighLatencyP95
+          expr: demo_api:http_latency_seconds:p95_5m > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: demo-api p95 latency above 500ms
+            description: 'p95 latency is {{ $value | humanizeDuration }}.'
+            runbook_url: https://github.com/sergiy22/k8s-observability-lab/blob/main/docs/runbooks.md#demoapihighlatencyp95
+
+        - alert: DemoApiPodRestarting
+          expr: increase(kube_pod_container_status_restarts_total{namespace="demo", container="demo-api"}[15m]) > 2
+          labels:
+            severity: warning
+          annotations:
+            summary: 'Pod {{ $labels.pod }} restarted more than twice in 15 minutes'
+            description: Check liveness probe failures and OOM kills with kubectl describe pod.
+            runbook_url: https://github.com/sergiy22/k8s-observability-lab/blob/main/docs/runbooks.md#demoapipodrestarting

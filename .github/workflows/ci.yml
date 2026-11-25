@@ -1,0 +1,267 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege by default; jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TERRAFORM_VERSION: "1.17.2"
+  KUBERNETES_VERSION: "1.36.4"
+  KIND_VERSION: "v0.33.0"
+  KUBECONFORM_VERSION: "v0.8.0"
+  PROMETHEUS_VERSION: "3.16.0"
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/demo-api
+
+jobs:
+  # ---------------------------------------------------------------- app
+  app:
+    name: App · lint & test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Ruff
+        run: ruff check . && ruff format --check .
+      - name: Pytest
+        run: pytest --cov=demo_api --cov-report=term-missing --cov-fail-under=90
+
+  # ---------------------------------------------------------------- terraform
+  terraform:
+    name: Terraform · fmt, validate, test, lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir:
+          - terraform/modules/kind-cluster
+          - terraform/modules/monitoring-stack
+          - terraform/environments/local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+        working-directory: ${{ matrix.dir }}
+      - name: terraform init
+        run: terraform init -backend=false -input=false
+        working-directory: ${{ matrix.dir }}
+      - name: terraform validate
+        run: terraform validate
+        working-directory: ${{ matrix.dir }}
+      - name: terraform test
+        if: startsWith(matrix.dir, 'terraform/modules/')
+        run: terraform test
+        working-directory: ${{ matrix.dir }}
+      - name: tflint
+        run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --config "$GITHUB_WORKSPACE/.tflint.hcl" --chdir "${{ matrix.dir }}"
+
+  # ---------------------------------------------------------------- kubernetes
+  manifests:
+    name: Kubernetes · schema & alert tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install kubeconform and promtool
+        run: |
+          mkdir -p "$HOME/bin" && echo "$HOME/bin" >> "$GITHUB_PATH"
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C "$HOME/bin" kubeconform
+          curl -sSL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" \
+            | tar -xz -C "$HOME/bin" --strip-components=1 "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+      - name: Render and validate manifests (incl. Prometheus Operator CRDs)
+        run: |
+          for overlay in k8s/base k8s/overlays/local; do
+            echo "::group::$overlay"
+            kubectl kustomize "$overlay" | kubeconform -strict -summary \
+              -kubernetes-version "$KUBERNETES_VERSION" \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+            echo "::endgroup::"
+          done
+      - name: Validate Grafana dashboard JSON
+        run: jq -e '.uid and .title and (.panels | length > 0)' k8s/base/dashboards/demo-api.json
+      - name: Lint and unit-test alerting rules
+        run: |
+          yq 'select(.kind == "PrometheusRule") | .spec' k8s/base/monitoring.yaml > k8s/tests/.generated-rules.yaml
+          promtool check rules k8s/tests/.generated-rules.yaml
+          promtool test rules k8s/tests/alerts.test.yaml
+
+  # ---------------------------------------------------------------- image
+  image:
+    name: Image · build, scan, publish
+    runs-on: ubuntu-latest
+    needs: [app]
+    permissions:
+      contents: read
+      packages: write          # push to GHCR (main only)
+      security-events: write   # upload Trivy SARIF to code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build image (loaded locally for scanning)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: app
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: APP_VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke-test the container
+        run: |
+          image="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
+          docker run -d --name demo -p 8080:8080 --read-only --tmpfs /tmp "$image"
+          for i in $(seq 1 20); do curl -fsS localhost:8080/healthz && break; sleep 1; done
+          curl -fsS localhost:8080/api/orders
+          curl -fsS localhost:8080/metrics | grep -q '^http_requests_total'
+          docker rm -f demo
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+      - name: Upload scan results
+        if: always() && hashFiles('trivy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          sarif_file: trivy.sarif
+      - name: Fail on fixable CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-setup-trivy: true
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: app
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: APP_VERSION=${{ github.sha }}
+          cache-from: type=gha
+
+  # ---------------------------------------------------------------- end-to-end
+  e2e:
+    name: E2E · kind + monitoring stack
+    runs-on: ubuntu-latest
+    needs: [app, terraform, manifests]
+    timeout-minutes: 30
+    env:
+      TF_DIR: terraform/environments/local
+      KUBECONFIG: ${{ github.workspace }}/terraform/environments/local/kubeconfig
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v${{ env.KUBERNETES_VERSION }}
+      - name: Install kind CLI (used only for image loading)
+        run: |
+          curl -sSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo install -m 0755 kind /usr/local/bin/kind
+
+      - name: Provision cluster and monitoring stack with Terraform
+        run: |
+          terraform -chdir="$TF_DIR" init -input=false
+          terraform -chdir="$TF_DIR" apply -input=false -auto-approve
+
+      - name: Build and load the app image
+        run: |
+          docker build -t demo-api:local --build-arg APP_VERSION=${{ github.sha }} app
+          kind load docker-image demo-api:local --name "$(terraform -chdir="$TF_DIR" output -raw kube_context | sed 's/^kind-//')"
+
+      - name: Deploy the app
+        run: |
+          kubectl apply -k k8s/overlays/local
+          kubectl -n demo rollout status deploy/demo-api --timeout=180s
+          kubectl -n demo rollout status deploy/loadgen --timeout=120s
+
+      - name: Smoke test through the Service
+        run: |
+          kubectl -n demo port-forward svc/demo-api 8080:80 >/dev/null 2>&1 &
+          for i in $(seq 1 20); do curl -fsS localhost:8080/healthz && break; sleep 1; done
+          curl -fsS localhost:8080/api/orders | jq -e '.orders | length == 3'
+
+      - name: Prometheus scrapes the app and loaded the alert rules
+        run: |
+          prom=http://localhost:9090
+          for i in $(seq 1 36); do
+            up=$(curl -fsS "$prom/api/v1/query" --data-urlencode 'query=sum(up{namespace="demo",service="demo-api"})' \
+              | jq -r '.data.result[0].value[1] // "0"')
+            echo "healthy targets: $up"
+            [ "$up" -ge 2 ] && break
+            sleep 5
+          done
+          [ "$up" -ge 2 ] || { echo "::error::demo-api targets not up in Prometheus"; exit 1; }
+          curl -fsS "$prom/api/v1/rules" | jq -e '[.data.groups[].name] | index("demo-api.alerts") != null'
+
+      - name: Grafana provisioned the dashboard
+        run: |
+          pw="$(terraform -chdir="$TF_DIR" output -raw grafana_admin_password)"
+          echo "::add-mask::$pw"
+          for i in $(seq 1 24); do
+            n=$(curl -fsS -u "admin:$pw" "http://localhost:3000/api/search?query=demo-api" | jq length) && [ "$n" -ge 1 ] && break
+            sleep 5
+          done
+          [ "${n:-0}" -ge 1 ] || { echo "::error::dashboard not found in Grafana"; exit 1; }
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl get nodes -o wide || true
+          kubectl get pods -A -o wide || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
+          kubectl -n demo describe pods || true
+
+      - name: Tear down
+        if: always()
+        run: terraform -chdir="$TF_DIR" destroy -input=false -auto-approve || kind delete clusters --all

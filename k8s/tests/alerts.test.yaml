@@ -1,0 +1,82 @@
+# Unit tests for alerting rules: `make test-alerts` (wraps `promtool test rules`).
+# The rules file is extracted from the PrometheusRule in k8s/base/monitoring.yaml.
+rule_files:
+  - .generated-rules.yaml
+
+evaluation_interval: 30s
+
+tests:
+  - name: healthy service fires nothing
+    interval: 15s
+    input_series:
+      - series: 'up{namespace="demo", service="demo-api", pod="a"}'
+        values: '1x60'
+      - series: 'http_requests_total{namespace="demo", service="demo-api", status="200"}'
+        values: '0+100x60'
+      - series: 'http_requests_total{namespace="demo", service="demo-api", status="500"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: DemoApiHighErrorRate
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: DemoApiDown
+        exp_alerts: []
+
+  - name: 10% errors for longer than 5m fires DemoApiHighErrorRate
+    interval: 15s
+    input_series:
+      - series: 'http_requests_total{namespace="demo", service="demo-api", status="200"}'
+        values: '0+90x60'
+      - series: 'http_requests_total{namespace="demo", service="demo-api", status="500"}'
+        values: '0+10x60'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: DemoApiHighErrorRate
+        exp_alerts: []          # still pending: `for: 5m` not reached
+      - eval_time: 12m
+        alertname: DemoApiHighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: demo-api 5xx ratio above 5%
+              description: Error ratio is 10% over the last 5 minutes.
+              runbook_url: https://github.com/sergiy22/k8s-observability-lab/blob/main/docs/runbooks.md#demoapihigherrorrate
+
+  - name: all targets down fires DemoApiDown
+    interval: 15s
+    input_series:
+      - series: 'up{namespace="demo", service="demo-api", pod="a"}'
+        values: '0x20'
+      - series: 'up{namespace="demo", service="demo-api", pod="b"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: DemoApiDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: demo-api has no healthy scrape targets
+              description: Prometheus cannot scrape any demo-api pod for 2 minutes.
+              runbook_url: https://github.com/sergiy22/k8s-observability-lab/blob/main/docs/runbooks.md#demoapidown
+
+  - name: frequent restarts fire DemoApiPodRestarting
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="demo", container="demo-api", pod="demo-api-1"}'
+        values: '0 0 1 2 3 4 5 5 5 5'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: DemoApiPodRestarting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: demo
+              container: demo-api
+              pod: demo-api-1
+            exp_annotations:
+              summary: Pod demo-api-1 restarted more than twice in 15 minutes
+              description: Check liveness probe failures and OOM kills with kubectl describe pod.
+              runbook_url: https://github.com/sergiy22/k8s-observability-lab/blob/main/docs/runbooks.md#demoapipodrestarting
