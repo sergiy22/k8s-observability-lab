@@ -127,7 +127,7 @@ flowchart LR
 | **e2e** | On a fresh kind cluster built by the same Terraform: app rolls out, Prometheus scrapes 2/2 targets, alert rules load, Grafana provisions the dashboard; always torn down |
 
 Supply-chain hygiene: all third-party actions are **pinned to commit SHAs**, workflow permissions
-are least-privilege per job, and Dependabot tracks actions, pip, Docker and Terraform providers.
+are least-privilege per job, and Terraform providers are locked for Linux and macOS.
 
 ## Design decisions
 
